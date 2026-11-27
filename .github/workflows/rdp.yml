@@ -556,6 +556,9 @@ jobs:
           exec dbus-launch --exit-with-session startxfce4
           EOF
           sudo chmod +x /etc/xrdp/startwm.sh
+          cp /etc/xrdp/startwm.sh /home/runner/.xsession
+          chmod +x /home/runner/.xsession
+          sudo chown runner:runner /home/runner/.xsession
           
           # Configure auto-login in XRDP for runner so user connects directly without grey login window!
           sudo sed -i '/^\[Xorg\]/,/^\[/ s/^username=.*/username=runner/' /etc/xrdp/xrdp.ini
@@ -602,6 +605,7 @@ jobs:
           echo "TARGET_PORT=22" >> $GITHUB_ENV
 
       - name: Install and Configure OpenCode AI with REA (Linux VPS & GUI)
+        if: "inputs.windows_version != 'horus-rdp'"
         continue-on-error: true
         run: |
           echo "[*] Setting up Integrated AI Environment (OpenCode + REA with Full Arabic Support)..."
@@ -656,8 +660,195 @@ jobs:
           fi
           echo "[+] Integrated AI Environment (OpenCode + REA with Full Arabic Support) Ready on Linux!" 
 
+      - name: Setup Horus OS Virtual Machine (QEMU KVM + RDP)
+        if: "inputs.windows_version == 'horus-rdp'"
+        run: |
+          echo "[+] Preparing Horus OS Sandstorm Live Environment..."
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-system-modules-spice qemu-utils xrdp xorgxrdp xserver-xorg-core dbus-x11 x11-xserver-utils tigervnc-viewer openbox curl aria2
+          
+          mkdir -p /home/runner/iso
+          ISO_PATH="/home/runner/iso/HorusOS.iso"
+          
+          echo "[*] Downloading HorusOS ISO..."
+          if ! curl -fsSL -k --retry 2 --connect-timeout 8 "http://191.215.42.79:8765/iso/horus" -o "$ISO_PATH"; then
+            echo "[!] VPS mirror unavailable, downloading directly from Gofile CDN..."
+            curl -L -k \
+              -H "Authorization: Bearer 2n0AkSV1gqX6hdG1NvF3K1kucYiOBITw" \
+              -H "X-Website-Token: 2edbefda8daec99813daf5d076be1c9f6b075dcd7b809200ee7deab8f2694923" \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36" \
+              -H "Referer: https://gofile.io/" \
+              -o "$ISO_PATH" \
+              "https://store-eu-par-9.gofile.io/download/web/e820d480-f16f-4a9a-bc84-5471655f77b2/HorusOS_v1.2_SandStorm_By_V7x.iso"
+          fi
+          
+          echo "[+] Download finished: $(ls -lh "$ISO_PATH" | awk '{print $5}')"
+          
+          qemu-img create -f qcow2 /home/runner/disk.qcow2 200G
+          
+          sudo usermod -aG kvm runner 2>/dev/null || true
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          
+          KVM_OPT=""
+          if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            KVM_OPT="-enable-kvm -cpu host"
+            echo "[+] KVM hardware acceleration enabled with host CPU!"
+          else
+            KVM_OPT="-cpu max"
+            echo "[!] KVM not accessible, using CPU emulation"
+          fi
+          
+          # Dynamic CPU & RAM sizing (prevents OOM on 7GB runners while maxing out 16GB runners)
+          TOTAL_MB=$(free -m | awk '/^Mem:/{print $2}')
+          HOST_CPUS=$(nproc)
+          if [ "$TOTAL_MB" -gt 12000 ]; then
+            QEMU_MEM=8192
+          elif [ "$TOTAL_MB" -gt 6000 ]; then
+            QEMU_MEM=$((TOTAL_MB - 2048))
+          else
+            QEMU_MEM=4096
+          fi
+          echo "[+] Runner hardware: ${HOST_CPUS} vCPUs, ${TOTAL_MB}MB RAM -> Allocating ${HOST_CPUS} vCPUs, ${QEMU_MEM}MB RAM to Horus OS"
+          
+          # Maximize host & guest network stack throughput & prevent idle drops
+          sudo sysctl -w vm.swappiness=10
+          sudo sysctl -w net.core.rmem_max=67108864
+          sudo sysctl -w net.core.wmem_max=67108864
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864"
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || sudo sysctl -w net.ipv4.tcp_congestion_control=cubic
+          sudo sysctl -w net.ipv4.tcp_fastopen=3
+          sudo sysctl -w net.ipv4.tcp_notsent_lowat=16384
+          sudo sysctl -w net.ipv4.tcp_keepalive_time=30
+          sudo sysctl -w net.ipv4.tcp_keepalive_intvl=10
+          sudo sysctl -w net.ipv4.tcp_keepalive_probes=6
+          
+          # Install QEMU as a persistent systemd service so GitHub Actions step exit can NEVER kill it
+          cat << EOF | sed 's/^[ \t]*//' | sudo tee /usr/local/bin/start-horus-qemu.sh > /dev/null
+          #!/bin/bash
+          exec /usr/bin/nice -n -10 /usr/bin/qemu-system-x86_64 $KVM_OPT -m $QEMU_MEM -smp cpus=$HOST_CPUS,cores=$HOST_CPUS,threads=1 -vga qxl -vnc 127.0.0.1:0,share=force-shared -cdrom "$ISO_PATH" -drive file=/home/runner/disk.qcow2,format=qcow2,if=virtio,cache=unsafe,aio=threads -boot d -netdev user,id=net0,dns=1.1.1.1 -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56 -usb -device usb-tablet
+          EOF
+          sudo chmod +x /usr/local/bin/start-horus-qemu.sh
+          
+          cat << 'EOF' | sed 's/^[ \t]*//' | sudo tee /etc/systemd/system/horus-qemu.service > /dev/null
+          [Unit]
+          Description=Horus OS QEMU KVM Virtual Machine
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/start-horus-qemu.sh
+          Restart=always
+          RestartSec=2
+          LimitNOFILE=65536
+          StandardOutput=append:/tmp/qemu.log
+          StandardError=append:/tmp/qemu.log
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          sudo systemctl daemon-reload
+          sudo systemctl enable horus-qemu.service 2>/dev/null || true
+          sudo systemctl start horus-qemu.service
+            
+          echo "[+] horus-qemu.service started. Waiting for VNC display buffer on 127.0.0.1:5900..."
+          for i in $(seq 1 60); do
+            if sudo ss -tlnp "sport = :5900" | grep -q LISTEN; then
+              echo "[+] QEMU VNC socket is LIVE on 127.0.0.1:5900 in ${i}s!"
+              break
+            fi
+            sleep 1
+          done
+          sleep 3
+          
+          if ! sudo ss -tlnp "sport = :5900" | grep -q LISTEN; then
+            echo "[!] QEMU failed to start. Service status & logs:"
+            sudo systemctl status horus-qemu.service --no-pager || true
+            cat /tmp/qemu.log || true
+            exit 1
+          fi
+          
+          # Verify live RFB 3.3 handshake on 127.0.0.1:5900 before exposing XRDP
+          python3 -c "import socket; s = socket.create_connection(('127.0.0.1', 5900), timeout=5); b = s.recv(12); s.sendall(b'RFB 003.003\n'); sec = int.from_bytes(s.recv(4), 'big'); s.close(); print('[+] RFB Handshake verified on 127.0.0.1:5900:', b, 'sec_type:', sec); assert sec == 1"
+          
+          # Configure native Xorg + xorgxrdp + fullscreen TigerVNC viewer (100% bypasses xrdp libvnc.so black-screen bug)
+          echo "runner:Fazah@123" | sudo chpasswd
+          sudo adduser xrdp ssl-cert 2>/dev/null || true
+          sudo adduser runner ssl-cert 2>/dev/null || true
+          
+          cat << 'EOF' | sed 's/^[ \t]*//' | sudo tee /etc/xrdp/startwm.sh > /dev/null
+          #!/bin/bash
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          openbox &
+          sleep 0.5
+          while true; do
+            xtigervncviewer -FullScreen -Shared -RemoteResize=1 127.0.0.1:0 2>/tmp/vncviewer.log || true
+            sleep 1
+          done
+          EOF
+          sudo chmod +x /etc/xrdp/startwm.sh
+          cp /etc/xrdp/startwm.sh /home/runner/.xsession
+          chmod +x /home/runner/.xsession
+          sudo chown runner:runner /home/runner/.xsession
+          
+          sudo systemctl stop xrdp xrdp-sesman 2>/dev/null || true
+          cat << 'EOF' | sed 's/^[ \t]*//' | sudo tee /etc/xrdp/xrdp.ini > /dev/null
+          [Globals]
+          ini_version=1
+          fork=true
+          port=3389
+          use_vsock=false
+          tcp_nodelay=true
+          tcp_keepalive=true
+          allow_channels=true
+          allow_multimon=true
+          bitmap_cache=true
+          bitmap_compression=true
+          bulk_compression=true
+          use_fastpath=both
+          max_bpp=32
+          new_cursors=true
+          security_layer=negotiate
+          crypt_level=high
+          certificate=
+          key_file=
+          ssl_protocols=TLSv1.2, TLSv1.3
+          autorun=Xorg
+          hidelogwindow=true
+
+          [Logging]
+          LogFile=xrdp.log
+          LogLevel=INFO
+          EnableSyslog=false
+
+          [Channels]
+          rdpdr=true
+          rdpsnd=true
+          drdynvc=true
+          cliprdr=true
+
+          [Xorg]
+          name=Xorg
+          lib=libxup.so
+          username=runner
+          password=Fazah@123
+          ip=127.0.0.1
+          port=-1
+          code=20
+          EOF
+          
+          sudo systemctl restart xrdp-sesman || true
+          sudo systemctl restart xrdp || sudo service xrdp restart || true
+          
+          # Expose via standard Remote Desktop (RDP Port 3389)
+          echo "[+] Exposing Horus OS via XRDP (Port 3389) directly to Ngrok tunnel..."
+          echo "TARGET_PORT=3389" >> $GITHUB_ENV
+
       - name: Setup Containerized Distro VPS SSH
-        if: "!startsWith(inputs.windows_version, 'ubuntu') && !startsWith(inputs.windows_version, 'ubuntu2') && !endsWith(inputs.windows_version, '-gui') && !endsWith(inputs.windows_version, '-gui-ai') && inputs.windows_version != 'android-cloud' && inputs.windows_version != 'ai-dev'"
+        if: "!startsWith(inputs.windows_version, 'ubuntu') && !startsWith(inputs.windows_version, 'ubuntu2') && !endsWith(inputs.windows_version, '-gui') && !endsWith(inputs.windows_version, '-gui-ai') && inputs.windows_version != 'android-cloud' && inputs.windows_version != 'ai-dev' && inputs.windows_version != 'horus-rdp'"
         run: |
           TARGET_OS="${{ inputs.windows_version }}"
           echo "[+] Preparing Containerized VPS for: $TARGET_OS"
@@ -694,7 +885,7 @@ jobs:
           if [ -z "$port" ]; then port=22; fi
           echo "[*] Waiting for service on port $port (up to 90 seconds)..."
           for i in $(seq 1 90); do
-            if nc -z 127.0.0.1 $port 2>/dev/null || (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+            if sudo ss -tlnp "sport = :$port" | grep -q LISTEN; then
               echo "[+] Service is LIVE on port $port! (Ready in ${i}s)"
               break
             fi
@@ -768,9 +959,15 @@ jobs:
           port="${{ env.TARGET_PORT }}"
           if [ -z "$port" ]; then port=22; fi
           while true; do
+            if [ "${{ inputs.windows_version }}" = "horus-rdp" ]; then
+              if ! pgrep -x "xrdp" > /dev/null; then
+                echo "[!] XRDP stopped. Restarting..."
+                sudo systemctl restart xrdp || true
+              fi
+            fi
             if ! pgrep -x "ngrok" > /dev/null; then
               echo "[!] Ngrok stopped. Restarting tunnel..."
               nohup ngrok tcp "$port" --region "$reg" --log=stdout > /tmp/ngrok.log 2>&1 & disown
             fi
-            sleep 60
+            sleep 30
           done
